@@ -1,12 +1,14 @@
 """
 Self-Contained Live Web Dashboard Server for Bitcoin Price Predictor (1 FPS).
 
-Provides an interactive real-time visualizer accessible via browser or Snowflake iframe:
-- Real-time animated canvas chart: Actual Price (solid green/cyan), Predicted Path (dotted orange).
+Provides an interactive real-time visualizer with uncompressed, 1:1 identical time-scale
+rendering across both historical second ticks and the next 25-minute (1,500s) predicted trajectory:
+- Real-time animated canvas chart: Actual Price (solid green/cyan), Predicted Path (dotted orange), Ground Truth (dashed blue).
+- Exact 1-to-1 linear second-by-second scale: Each second in the past and future occupies the identical pixel width.
+- Time axis markers: -25m, -20m, -15m, -10m, -5m, NOW (t=0), +5m, +10m, +15m, +20m, +25m.
 - Real-time Accuracy Bar & Stability Gauges.
 - Random day market selector across 2020 - 2026 regimes.
 - 1 FPS real-time replay loop with play/pause and fast-forward controls.
-- Pure zero-external-dependency self-contained HTML5/Canvas rendering.
 """
 
 import os
@@ -48,8 +50,8 @@ class GlobalDashboardState:
         self.predictor = HybridPredictor(device="cpu", horizon_mins=25)
         self.trainer = OnlineRewardTrainer(self.predictor)
 
-        # Ring buffers for web client
-        self.history_len = 300
+        # 1:1 scale history: keep 1,500 past seconds (25 minutes) to match the 25-minute future horizon
+        self.history_len = 1500
         self.hist_timestamps = []
         self.hist_prices = []
         self.latest_tick = None
@@ -93,6 +95,8 @@ class GlobalDashboardState:
                 current_price=tick.price,
                 predicted_trajectory=pred_trajectory,
                 future_ground_truth=future_gt,
+                features=features.feature_vector,
+                past_12h_prices=past_12h,
                 update_model=True
             )
 
@@ -102,10 +106,9 @@ class GlobalDashboardState:
                 self.hist_timestamps.pop(0)
                 self.hist_prices.pop(0)
 
-            # Subsample 1500 future seconds to 50 visualization points for lightweight JSON transport
-            step = 30  # every 30 seconds
-            self.latest_prediction = [round(float(p), 2) for p in pred_trajectory[::step]]
-            self.latest_ground_truth = [round(float(p), 2) for p in future_gt[::step]]
+            # Transmit full 1,500 second-by-second uncompressed predictions and ground truth
+            self.latest_prediction = [round(float(p), 2) for p in pred_trajectory]
+            self.latest_ground_truth = [round(float(p), 2) for p in future_gt]
             self.latest_tick = tick.to_dict()
             self.latest_eval = {
                 "timestamp": eval_res.timestamp,
@@ -190,7 +193,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .legend { display: flex; gap: 14px; font-size: 12px; }
   .legend-item { display: flex; align-items: center; gap: 6px; }
   .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-  canvas { width: 100%; height: 340px; display: block; }
+  canvas { width: 100%; height: 380px; display: block; }
 
   .accuracy-panel { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 8px; padding: 14px; }
   .bar-row { margin-bottom: 12px; }
@@ -208,7 +211,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="header">
   <div class="title-group">
     <h1><span>⚡</span> BTC/USD 25-Min Real-Time Price Predictor</h1>
-    <p id="sub-header">Replaying second-by-second historical market regime • Continuous Real-Time Reward Training</p>
+    <p id="sub-header">1:1 Uncompressed Second Scale • 25-Min Past vs 25-Min Future • Continuous Real-Time Reward Training</p>
   </div>
   <div class="controls">
     <button id="btn-random" onclick="pickRandomDay()">🎲 Random Day (2020-2026)</button>
@@ -249,11 +252,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <div class="chart-container">
   <div class="chart-header">
-    <span style="font-size:13px; font-weight:600; color:#b0bec5;" id="chart-regime-title">Live Second-by-Second Stream & 25-Min Forecast Trajectory</span>
+    <span style="font-size:13px; font-weight:600; color:#b0bec5;" id="chart-regime-title">Live 1:1 Second Scale: -25 Min Past (Solid) vs +25 Min Predicted (Dotted) & Ground Truth</span>
     <div class="legend">
-      <div class="legend-item"><span class="dot" style="background:var(--accent-green)"></span> Actual Market Price</div>
-      <div class="legend-item"><span class="dot" style="background:var(--accent-orange)"></span> 25-Min Predicted (Dotted)</div>
-      <div class="legend-item"><span class="dot" style="background:#2979ff"></span> Ground Truth (Stored Data)</div>
+      <div class="legend-item"><span class="dot" style="background:var(--accent-green)"></span> Actual Market Price (-25m to 0)</div>
+      <div class="legend-item"><span class="dot" style="background:var(--accent-orange)"></span> Model Predicted (0 to +25m Dotted)</div>
+      <div class="legend-item"><span class="dot" style="background:#2979ff"></span> Ground Truth (0 to +25m Dashed)</div>
     </div>
   </div>
   <canvas id="marketCanvas"></canvas>
@@ -287,7 +290,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   function resizeCanvas() {
     canvas.width = canvas.parentElement.clientWidth - 28;
-    canvas.height = 340;
+    canvas.height = 380;
   }
   window.addEventListener("resize", resizeCanvas);
   resizeCanvas();
@@ -316,72 +319,118 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     if (!histPrices || histPrices.length === 0) return;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    let allPrices = [...histPrices, ...(predPrices || []), ...(gtPrices || [])];
+    // 1:1 UNCOMPRESSED SCALE:
+    // Past window: 1500 seconds (-25 mins to 0)
+    // Future window: 1500 seconds (0 to +25 mins)
+    // Total time axis: 3000 seconds (exact 50% past, 50% future)
+    const MAX_PAST_SEC = 1500;
+    const FUTURE_SEC = 1500;
+    const TOTAL_TIMEFRAME_SEC = MAX_PAST_SEC + FUTURE_SEC; // 3000s
+
+    let pastLen = Math.min(histPrices.length, MAX_PAST_SEC);
+    let pastSlice = histPrices.slice(-pastLen);
+
+    let allPrices = [...pastSlice, ...(predPrices || []), ...(gtPrices || [])];
     let minP = Math.min(...allPrices);
     let maxP = Math.max(...allPrices);
     let pad = (maxP - minP) * 0.1 || 10;
     minP -= pad;
     maxP += pad;
 
-    let totalPoints = histPrices.length + (predPrices ? predPrices.length : 0);
-    let currentX = (histPrices.length / totalPoints) * canvas.width;
+    // NOW (t=0) is positioned at exactly 50% width when full 1500s history is available
+    const currentX = (MAX_PAST_SEC / TOTAL_TIMEFRAME_SEC) * canvas.width;
+    const secToPx = canvas.width / TOTAL_TIMEFRAME_SEC; // Exact 1:1 pixels per second
 
     function getY(p) {
-      return canvas.height - ((p - minP) / (maxP - minP)) * (canvas.height - 40) - 20;
+      return canvas.height - ((p - minP) / (maxP - minP)) * (canvas.height - 60) - 30;
     }
 
-    // Grid lines
+    function getPastX(indexInSlice) {
+      // Relative seconds from NOW (t=0)
+      let relSec = -(pastLen - 1 - indexInSlice);
+      return currentX + (relSec * secToPx);
+    }
+
+    function getFutureX(secIndex) {
+      // secIndex is 0..1499 (1s to 1500s into future)
+      return currentX + ((secIndex + 1) * secToPx);
+    }
+
+    // Horizontal Price Grid Lines
     ctx.strokeStyle = "#1a253a";
     ctx.lineWidth = 1;
-    for (let i = 1; i <= 4; i++) {
-      let y = (canvas.height / 5) * i;
+    for (let i = 1; i <= 5; i++) {
+      let y = (canvas.height / 6) * i;
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(canvas.width, y);
       ctx.stroke();
 
-      let pVal = maxP - (i / 5) * (maxP - minP);
+      let pVal = maxP - (i / 6) * (maxP - minP);
       ctx.fillStyle = "#5c7090";
-      ctx.font = "10px sans-serif";
-      ctx.fillText("$" + pVal.toFixed(2), 6, y - 4);
+      ctx.font = "10px monospace";
+      ctx.fillText("$" + pVal.toFixed(2), 8, y - 4);
     }
 
-    // Vertical line separating history and future forecast
-    ctx.strokeStyle = "rgba(0, 229, 255, 0.3)";
-    ctx.setLineDash([4, 4]);
-    ctx.beginPath();
-    ctx.moveTo(currentX, 0);
-    ctx.lineTo(currentX, canvas.height);
-    ctx.stroke();
-    ctx.setLineDash([]);
+    // Vertical Time Grid Lines (every 5 minutes = 300 seconds)
+    const timeLabels = [
+      { sec: -1500, label: "-25m" },
+      { sec: -1200, label: "-20m" },
+      { sec: -900,  label: "-15m" },
+      { sec: -600,  label: "-10m" },
+      { sec: -300,  label: "-5m" },
+      { sec: 0,     label: "NOW (0s)" },
+      { sec: 300,   label: "+5m" },
+      { sec: 600,   label: "+10m" },
+      { sec: 900,   label: "+15m" },
+      { sec: 1200,  label: "+20m" },
+      { sec: 1500,  label: "+25m" },
+    ];
 
-    ctx.fillStyle = "#00e5ff";
-    ctx.font = "10px sans-serif";
-    ctx.fillText("NOW (t=0)", currentX - 25, 14);
+    timeLabels.forEach(tl => {
+      let x = currentX + (tl.sec * secToPx);
+      if (x >= 0 && x <= canvas.width) {
+        ctx.strokeStyle = tl.sec === 0 ? "rgba(0, 229, 255, 0.6)" : "#162033";
+        ctx.lineWidth = tl.sec === 0 ? 1.5 : 1;
+        if (tl.sec === 0) ctx.setLineDash([4, 4]); else ctx.setLineDash([]);
+        
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height - 20);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = tl.sec === 0 ? "#00e5ff" : "#5c7090";
+        ctx.font = tl.sec === 0 ? "bold 11px sans-serif" : "10px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(tl.label, x, canvas.height - 6);
+        ctx.textAlign = "start";
+      }
+    });
 
     // 1. Draw Historical Prices (Solid Green)
     ctx.strokeStyle = "#00e676";
     ctx.lineWidth = 2.2;
     ctx.beginPath();
-    for (let i = 0; i < histPrices.length; i++) {
-      let x = (i / totalPoints) * canvas.width;
-      let y = getY(histPrices[i]);
+    for (let i = 0; i < pastLen; i++) {
+      let x = getPastX(i);
+      let y = getY(pastSlice[i]);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
     ctx.stroke();
 
-    let lastHistY = getY(histPrices[histPrices.length - 1]);
+    let lastHistY = getY(pastSlice[pastLen - 1]);
 
-    // 2. Draw Ground Truth Future (Blue Dashed)
+    // 2. Draw Ground Truth Future (Blue Dashed) - Exactly 1:1 scale over next 1,500s
     if (gtPrices && gtPrices.length > 0) {
-      ctx.strokeStyle = "rgba(41, 121, 255, 0.7)";
-      ctx.setLineDash([3, 3]);
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "rgba(41, 121, 255, 0.75)";
+      ctx.setLineDash([4, 4]);
+      ctx.lineWidth = 1.6;
       ctx.beginPath();
       ctx.moveTo(currentX, lastHistY);
       for (let i = 0; i < gtPrices.length; i++) {
-        let x = ((histPrices.length + i) / totalPoints) * canvas.width;
+        let x = getFutureX(i);
         let y = getY(gtPrices[i]);
         ctx.lineTo(x, y);
       }
@@ -389,28 +438,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       ctx.setLineDash([]);
     }
 
-    // 3. Draw Model Predicted 25-Min Future (Dotted Orange)
+    // 3. Draw Model Predicted 25-Min Future (Dotted Orange) - Exactly 1:1 scale over next 1,500s
     if (predPrices && predPrices.length > 0) {
       ctx.strokeStyle = "#ff9100";
-      ctx.setLineDash([2, 4]);
+      ctx.setLineDash([3, 5]);
       ctx.lineWidth = 3.0;
       ctx.beginPath();
       ctx.moveTo(currentX, lastHistY);
       for (let i = 0; i < predPrices.length; i++) {
-        let x = ((histPrices.length + i) / totalPoints) * canvas.width;
+        let x = getFutureX(i);
         let y = getY(predPrices[i]);
         ctx.lineTo(x, y);
       }
       ctx.stroke();
       ctx.setLineDash([]);
 
-      // Glow on latest prediction point
-      let lastPredX = ((histPrices.length + predPrices.length - 1) / totalPoints) * canvas.width;
+      // Glow on 25-min final forecast point (+1,500s)
+      let lastPredX = getFutureX(predPrices.length - 1);
       let lastPredY = getY(predPrices[predPrices.length - 1]);
       ctx.fillStyle = "#ff9100";
       ctx.beginPath();
-      ctx.arc(lastPredX, lastPredY, 4, 0, Math.PI * 2);
+      ctx.arc(lastPredX, lastPredY, 5, 0, Math.PI * 2);
       ctx.fill();
+
+      // Label at end of prediction
+      ctx.fillStyle = "#ff9100";
+      ctx.font = "bold 10px monospace";
+      ctx.fillText("$" + predPrices[predPrices.length - 1].toFixed(2), lastPredX - 55, lastPredY - 8);
     }
   }
 
@@ -438,7 +492,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById("val-reward").innerText = (ev.realtime_reward >= 0 ? "+" : "") + ev.realtime_reward.toFixed(3);
       document.getElementById("val-reward").style.color = ev.realtime_reward >= 0 ? "var(--accent-green)" : "var(--accent-red)";
 
-      document.getElementById("chart-regime-title").innerText = "Market Regime: " + data.day_str + " (1 FPS Real-Time Stream)";
+      document.getElementById("chart-regime-title").innerText = "Market Regime: " + data.day_str + " (1:1 Second Scale • 1 FPS Replay)";
 
       // Bars
       document.getElementById("bar-acc-val").innerText = ev.accuracy_percentage.toFixed(1) + "%";
@@ -505,7 +559,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def log_message(self, format, *args):
-        # Silence standard HTTP logs to avoid clutter
+        # Silence standard HTTP logs
         pass
 
 

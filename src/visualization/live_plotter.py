@@ -2,10 +2,11 @@
 Real-Time 1 FPS Live Animated Plotter for Bitcoin Price Predictions.
 
 Renders:
-1. Upper Chart:
-   - Solid Line: Historical & Actual Market Price (last 1 hour context).
-   - Dotted Line: 25-minute Model Predicted Trajectory (next 1,500s).
-   - Ground Truth Marker: True market path stored in dataset.
+1. Upper Chart (1:1 Uncompressed Second Scale):
+   - Solid Line: Historical & Actual Market Price (-25 mins past context = -1,500s).
+   - Dotted Line: 25-minute Model Predicted Trajectory (0 to +25 mins = +1,500s).
+   - Dashed Line: Ground Truth (0 to +25 mins = +1,500s).
+   - Exact identical 1:1 linear time scale where past 25m and future 25m span equal width.
 2. Lower Chart / Bar Panel:
    - Dynamic Accuracy Bar: Directional Accuracy % and Relative Proximity.
    - Live Metric Badges: Real-time MAE ($), RMSE ($), Stability Score (%), and Online Reward.
@@ -33,7 +34,7 @@ except ImportError:
 
 class LivePredictorPlotter:
     """
-    Renders live 1 FPS Matplotlib / Notebook animated graphs.
+    Renders live 1 FPS Matplotlib / Notebook animated graphs with 1:1 uncompressed scale.
     """
 
     def __init__(
@@ -42,7 +43,7 @@ class LivePredictorPlotter:
         analyser: MarketAnalyser,
         predictor: HybridPredictor,
         trainer: OnlineRewardTrainer,
-        history_window_sec: int = 1800,  # 30 mins past history
+        history_window_sec: int = 1500,  # 25 mins past history (1:1 match with 25m future)
         horizon_sec: int = 1500,         # 25 mins future horizon
     ):
         self.simulator = simulator
@@ -71,22 +72,35 @@ class LivePredictorPlotter:
     def setup_figure(self) -> Tuple[plt.Figure, Any, Any]:
         """Configures the dark-themed financial trading visualizer layout."""
         plt.style.use("dark_background")
-        fig = plt.figure(figsize=(14, 8), dpi=100)
+        fig = plt.figure(figsize=(15, 8.5), dpi=100)
         gs = GridSpec(4, 1, figure=fig, hspace=0.35)
 
         ax_main = fig.add_subplot(gs[0:3, 0])
         ax_bar = fig.add_subplot(gs[3, 0])
 
-        ax_main.set_title("Bitcoin Real-Time 25-Min Price Predictor (1 FPS)", fontsize=14, color="#00E5FF", pad=12, fontweight="bold")
+        ax_main.set_title(
+            "Bitcoin Real-Time 25-Min Price Predictor (1:1 Second Scale • 1 FPS)",
+            fontsize=14, color="#00E5FF", pad=12, fontweight="bold"
+        )
         ax_main.set_ylabel("BTC / USD ($)", fontsize=11, color="#E0E0E0")
+        ax_main.set_xlabel("Timeline (Seconds from NOW: -1500s to +1500s)", fontsize=10, color="#B0BEC5")
         ax_main.grid(True, linestyle="--", alpha=0.3, color="#404040")
 
-        # Main lines
-        (self.line_actual,) = ax_main.plot([], [], label="Actual Market Price", color="#00E676", linewidth=2.0)
-        (self.line_pred,) = ax_main.plot([], [], label="Model Predicted (Next 25 Min)", color="#FF9100", linestyle=":", linewidth=2.5)
-        (self.line_gt,) = ax_main.plot([], [], label="Ground Truth (Stored Data)", color="#2979FF", linestyle="--", linewidth=1.2, alpha=0.6)
+        # Time ticks every 5 minutes (300 seconds)
+        time_ticks = [-1500, -1200, -900, -600, -300, 0, 300, 600, 900, 1200, 1500]
+        time_labels = ["-25m", "-20m", "-15m", "-10m", "-5m", "NOW (0s)", "+5m", "+10m", "+15m", "+20m", "+25m"]
+        ax_main.set_xticks(time_ticks)
+        ax_main.set_xticklabels(time_labels, fontsize=9, color="#B0BEC5")
 
-        ax_main.legend(loc="upper left", framealpha=0.8, facecolor="#1E1E1E", edgecolor="#333333")
+        # Vertical line at NOW (t=0)
+        ax_main.axvline(0, color="#00E5FF", linestyle="--", linewidth=1.5, alpha=0.6, label="Current Second (t=0)")
+
+        # Main lines
+        (self.line_actual,) = ax_main.plot([], [], label="Actual Market Price (-25m to 0)", color="#00E676", linewidth=2.2)
+        (self.line_pred,) = ax_main.plot([], [], label="Model Predicted (0 to +25m)", color="#FF9100", linestyle=":", linewidth=2.8)
+        (self.line_gt,) = ax_main.plot([], [], label="Ground Truth (0 to +25m)", color="#2979FF", linestyle="--", linewidth=1.5, alpha=0.7)
+
+        ax_main.legend(loc="upper left", framealpha=0.85, facecolor="#131C2E", edgecolor="#1F2D48")
 
         # Lower Accuracy Bar Panel
         ax_bar.set_title("Real-Time Accuracy & Stability", fontsize=10, color="#B0BEC5", pad=6)
@@ -124,7 +138,7 @@ class LivePredictorPlotter:
         features = self.analyser.process_tick(tick)
         past_12h = self.simulator.get_past_window_prices(window_seconds=43200)
 
-        # Model Inference
+        # Model Inference (uncompressed 1,500 future seconds)
         pred_trajectory = self.predictor.predict_25min_trajectory(
             current_price=tick.price,
             features=features.feature_vector,
@@ -137,6 +151,8 @@ class LivePredictorPlotter:
             current_price=tick.price,
             predicted_trajectory=pred_trajectory,
             future_ground_truth=future_gt,
+            features=features.feature_vector,
+            past_12h_prices=past_12h,
             update_model=True
         )
 
@@ -144,7 +160,7 @@ class LivePredictorPlotter:
         self.timestamps_hist.append(tick.timestamp)
         self.actual_prices_hist.append(tick.price)
 
-        # Keep rolling window
+        # Keep rolling window of 1,500 seconds (exact 1:1 match with future 1,500s)
         if len(self.timestamps_hist) > self.history_window_sec:
             self.timestamps_hist.pop(0)
             self.actual_prices_hist.pop(0)
@@ -155,21 +171,28 @@ class LivePredictorPlotter:
         return True
 
     def update_frame(self, frame_num: int):
-        """Animation update function called at 1 FPS."""
+        """Animation update function called at 1 FPS with exact 1:1 scale."""
         has_more = self.step_simulation()
         if not has_more or self.last_eval is None:
             return self.line_actual, self.line_pred, self.line_gt
 
-        # X-axes: relative seconds (-history_window to +horizon_sec)
-        t_hist_rel = np.arange(-len(self.actual_prices_hist) + 1, 1)
+        # X-axes: relative seconds (-1500 to +1500 with exact 1:1 linear scaling)
+        past_len = len(self.actual_prices_hist)
+        t_hist_rel = np.arange(-past_len + 1, 1)
         t_future_rel = np.arange(1, self.horizon_sec + 1)
+
+        # Connect t=0 boundary smoothly
+        p_curr = self.actual_prices_hist[-1]
+        t_future_connected = np.concatenate([[0], t_future_rel])
+        pred_connected = np.concatenate([[p_curr], self.last_pred_trajectory])
+        gt_connected = np.concatenate([[p_curr], self.last_ground_truth])
 
         # Update Main Graph
         self.line_actual.set_data(t_hist_rel, self.actual_prices_hist)
-        self.line_pred.set_data(t_future_rel, self.last_pred_trajectory)
-        self.line_gt.set_data(t_future_rel, self.last_ground_truth)
+        self.line_pred.set_data(t_future_connected, pred_connected)
+        self.line_gt.set_data(t_future_connected, gt_connected)
 
-        # Set Plot Limits
+        # Set Plot Limits with 1:1 symmetric bounds (-1500s to +1500s)
         all_y = np.concatenate([self.actual_prices_hist, self.last_pred_trajectory, self.last_ground_truth])
         y_min = float(np.min(all_y)) * 0.998
         y_max = float(np.max(all_y)) * 1.002
